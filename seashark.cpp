@@ -2,6 +2,7 @@
 #include "CModelInfo.h"
 #include "CVehicleModelInfo.h"
 #include "CVehicle.h"
+#include "CBoat.h"
 #include "CPed.h"
 #include "CAnimManager.h"
 #include "CAnimBlendAssociation.h"
@@ -14,6 +15,8 @@
 #include "CPad.h"
 #include "common.h"
 #include "RenderWare.h"
+#include "CMatrix.h"
+#include <cstring>
 
 using namespace plugin;
 
@@ -23,6 +26,38 @@ enum {
 
 static CRideAnimData g_RideData;
 static tBikeHandlingData* g_BikeHandling = nullptr;
+static const float QUAD_HBSTEER_ANIM_MULT = -0.2f;
+
+// KeepWaterOut hook state
+static unsigned char g_BoatRenderOriginal[5];
+static bool g_BoatRenderHooked = false;
+
+static RwFrame* FindHandlebarFrame(RpClump* clump)
+{
+    if (!clump)
+        return nullptr;
+    return CClumpModelInfo::GetFrameFromName(clump, const_cast<char*>("handlebars"));
+}
+
+static void UpdateHandlebars(CVehicle* veh)
+{
+    if (!veh || !veh->m_pRwClump)
+        return;
+
+    RwFrame* hb = FindHandlebarFrame(reinterpret_cast<RpClump*>(veh->m_pRwClump));
+    if (!hb)
+        return;
+
+    float animLeanLeft = *reinterpret_cast<float*>(reinterpret_cast<char*>(&g_RideData) + 0x14);
+
+    if (animLeanLeft == 0.0f && veh->m_fSteerAngle != 0.0f)
+        animLeanLeft = veh->m_fSteerAngle;
+
+    CMatrix mat;
+    mat.Attach(RwFrameGetMatrix(hb), false);
+    mat.SetRotateZOnly(QUAD_HBSTEER_ANIM_MULT * animLeanLeft);
+    mat.UpdateRW();
+}
 
 static void UpdateRideDataLikeQuad(CVehicle* veh)
 {
@@ -64,7 +99,7 @@ static void ApplyBaseAndRider(CVehicle* veh, CPed* driver)
 
     RpClump* clump = reinterpret_cast<RpClump*>(driver->m_pRwClump);
 
-    // 1) Locked static seating UNDER everything
+    // Locked base sit
     CAnimBlendAssociation* base = CAnimManager::BlendAnimation(clump, 10, QUAD_RIDE_0, 1000.0f);
     if (base)
     {
@@ -72,12 +107,35 @@ static void ApplyBaseAndRider(CVehicle* veh, CPed* driver)
         base->m_fCurrentTime = 0.0f;
     }
 
-    // 2) Real Quad rider anims ON TOP (steering / lean)
+    // Rider anims (steering) on top
     UpdateRideDataLikeQuad(veh);
 
     using Fn = void(__cdecl*)(CPed*, CVehicle*, CRideAnimData*, tBikeHandlingData*, short);
     static Fn ProcessRiderAnims = (Fn)0x6B7280;
     ProcessRiderAnims(driver, veh, &g_RideData, g_BikeHandling, 0);
+
+    // Handlebars after rider data is updated
+    UpdateHandlebars(veh);
+}
+
+// ============================================================
+// Disable KeepWaterOut square for Dinghy (same idea as Skimmer)
+// CBoat::Render @ 0x6F0210
+// ============================================================
+static void __fastcall HookedBoatRender(CBoat* self, void* /*edx*/)
+{
+    if (self && self->m_nModelIndex == 473)
+    {
+        self->m_nTimeTillWeNeedThisCar = CTimer::m_snTimeInMilliseconds + 3000;
+        // Draw the boat mesh only – skip the invisible water-out quad
+        reinterpret_cast<void(__thiscall*)(CVehicle*)>(0x6D0E60)(self);
+        return;
+    }
+
+    // Other boats: original Render
+    memcpy(reinterpret_cast<void*>(0x6F0210), g_BoatRenderOriginal, 5);
+    reinterpret_cast<void(__thiscall*)(CBoat*)>(0x6F0210)(self);
+    plugin::patch::RedirectJump(0x6F0210, (void*)HookedBoatRender);
 }
 
 class JetSkiWayA
@@ -106,6 +164,14 @@ public:
                 unsigned int idx = quad->m_nHandlingId;
                 if (idx >= 13) idx = 0;
                 g_BikeHandling = &gHandlingDataMgr.m_aBikeHandling[idx];
+
+                // Install KeepWaterOut disable once
+                if (!g_BoatRenderHooked)
+                {
+                    memcpy(g_BoatRenderOriginal, reinterpret_cast<void*>(0x6F0210), 5);
+                    plugin::patch::RedirectJump(0x6F0210, (void*)HookedBoatRender);
+                    g_BoatRenderHooked = true;
+                }
             };
 
         static auto origGetRide = (CRideAnimData * (__thiscall*)(CVehicle*))0x871F3C;

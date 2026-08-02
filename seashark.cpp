@@ -28,9 +28,19 @@ static CRideAnimData g_RideData;
 static tBikeHandlingData* g_BikeHandling = nullptr;
 static const float QUAD_HBSTEER_ANIM_MULT = -0.2f;
 
-// KeepWaterOut hook state
 static unsigned char g_BoatRenderOriginal[5];
 static bool g_BoatRenderHooked = false;
+
+// Search the small bike-handling table by its own m_nVehicleId field,
+// instead of misusing a general handling ID as a direct array index.
+static tBikeHandlingData* FindQuadBikeHandling(unsigned char generalHandlingId)
+{
+    for (int i = 0; i < 13; ++i) {
+        if (gHandlingDataMgr.m_aBikeHandling[i].m_nVehicleId == generalHandlingId)
+            return &gHandlingDataMgr.m_aBikeHandling[i];
+    }
+    return nullptr;
+}
 
 static RwFrame* FindHandlebarFrame(RpClump* clump)
 {
@@ -99,7 +109,6 @@ static void ApplyBaseAndRider(CVehicle* veh, CPed* driver)
 
     RpClump* clump = reinterpret_cast<RpClump*>(driver->m_pRwClump);
 
-    // Locked base sit
     CAnimBlendAssociation* base = CAnimManager::BlendAnimation(clump, 10, QUAD_RIDE_0, 1000.0f);
     if (base)
     {
@@ -107,32 +116,24 @@ static void ApplyBaseAndRider(CVehicle* veh, CPed* driver)
         base->m_fCurrentTime = 0.0f;
     }
 
-    // Rider anims (steering) on top
     UpdateRideDataLikeQuad(veh);
 
     using Fn = void(__cdecl*)(CPed*, CVehicle*, CRideAnimData*, tBikeHandlingData*, short);
     static Fn ProcessRiderAnims = (Fn)0x6B7280;
     ProcessRiderAnims(driver, veh, &g_RideData, g_BikeHandling, 0);
 
-    // Handlebars after rider data is updated
     UpdateHandlebars(veh);
 }
 
-// ============================================================
-// Disable KeepWaterOut square for Dinghy (same idea as Skimmer)
-// CBoat::Render @ 0x6F0210
-// ============================================================
 static void __fastcall HookedBoatRender(CBoat* self, void* /*edx*/)
 {
     if (self && self->m_nModelIndex == 473)
     {
         self->m_nTimeTillWeNeedThisCar = CTimer::m_snTimeInMilliseconds + 3000;
-        // Draw the boat mesh only – skip the invisible water-out quad
         reinterpret_cast<void(__thiscall*)(CVehicle*)>(0x6D0E60)(self);
         return;
     }
 
-    // Other boats: original Render
     memcpy(reinterpret_cast<void*>(0x6F0210), g_BoatRenderOriginal, 5);
     reinterpret_cast<void(__thiscall*)(CBoat*)>(0x6F0210)(self);
     plugin::patch::RedirectJump(0x6F0210, (void*)HookedBoatRender);
@@ -161,11 +162,9 @@ public:
                 g_RideData = {};
                 g_RideData.m_nAnimGroup = 10;
 
-                unsigned int idx = quad->m_nHandlingId;
-                if (idx >= 13) idx = 0;
-                g_BikeHandling = &gHandlingDataMgr.m_aBikeHandling[idx];
+                // Fixed: search bike-handling table by its own ID field.
+                g_BikeHandling = FindQuadBikeHandling(quad->m_nHandlingId);
 
-                // Install KeepWaterOut disable once
                 if (!g_BoatRenderHooked)
                 {
                     memcpy(g_BoatRenderOriginal, reinterpret_cast<void*>(0x6F0210), 5);

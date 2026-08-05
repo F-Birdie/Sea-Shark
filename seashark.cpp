@@ -16,6 +16,9 @@
 #include "common.h"
 #include "RenderWare.h"
 #include "CMatrix.h"
+#include "CWaterLevel.h"
+#include "Fx_c.h"
+#include "FxPrtMult_c.h"
 #include <cstring>
 
 using namespace plugin;
@@ -28,25 +31,28 @@ static CRideAnimData g_RideData;
 static tBikeHandlingData* g_BikeHandling = nullptr;
 static const float QUAD_HBSTEER_ANIM_MULT = -0.2f;
 
+static const float LEAN_FWD_COM = 0.50f;
+static const float LEAN_BACK_COM = 0.15f;
+
 static unsigned char g_BoatRenderOriginal[5];
 static bool g_BoatRenderHooked = false;
+static bool g_GameReady = false;
 
-// Search the small bike-handling table by its own m_nVehicleId field,
-// instead of misusing a general handling ID as a direct array index.
 static tBikeHandlingData* FindQuadBikeHandling(unsigned char generalHandlingId)
 {
-    for (int i = 0; i < 13; ++i) {
+    for (int i = 0; i < 13; ++i)
+    {
         if (gHandlingDataMgr.m_aBikeHandling[i].m_nVehicleId == generalHandlingId)
             return &gHandlingDataMgr.m_aBikeHandling[i];
     }
     return nullptr;
 }
 
-static RwFrame* FindHandlebarFrame(RpClump* clump)
+static RwFrame* FindFrame(RpClump* clump, const char* name)
 {
-    if (!clump)
+    if (!clump || !name)
         return nullptr;
-    return CClumpModelInfo::GetFrameFromName(clump, const_cast<char*>("handlebars"));
+    return CClumpModelInfo::GetFrameFromName(clump, const_cast<char*>(name));
 }
 
 static void UpdateHandlebars(CVehicle* veh)
@@ -54,12 +60,11 @@ static void UpdateHandlebars(CVehicle* veh)
     if (!veh || !veh->m_pRwClump)
         return;
 
-    RwFrame* hb = FindHandlebarFrame(reinterpret_cast<RpClump*>(veh->m_pRwClump));
+    RwFrame* hb = FindFrame(reinterpret_cast<RpClump*>(veh->m_pRwClump), "handlebars");
     if (!hb)
         return;
 
     float animLeanLeft = *reinterpret_cast<float*>(reinterpret_cast<char*>(&g_RideData) + 0x14);
-
     if (animLeanLeft == 0.0f && veh->m_fSteerAngle != 0.0f)
         animLeanLeft = veh->m_fSteerAngle;
 
@@ -91,15 +96,86 @@ static void UpdateRideDataLikeQuad(CVehicle* veh)
     leanAngle = fValue * leanAngle
         - fullAnimLean * veh->m_fSteerAngle / steeringLockRad * (1.0f - fValue);
 
+    float* leanFwd = reinterpret_cast<float*>(reinterpret_cast<char*>(&g_RideData) + 0x10);
     CPad* pad = CPad::GetPad(0);
+
+    float target = 0.0f;
     if (pad)
+        target = float(-pad->GetSteeringUpDown()) / 128.0f;
+
+    *leanFwd += (target - *leanFwd) * CTimer::ms_fTimeStep / 5.0f;
+    if (*leanFwd > 1.0f) *leanFwd = 1.0f;
+    if (*leanFwd < -1.0f) *leanFwd = -1.0f;
+    if (*leanFwd > -0.02f && *leanFwd < 0.02f)
+        *leanFwd = 0.0f;
+}
+
+static void ApplyPhysicalLean(CVehicle* veh)
+{
+    if (!veh || !veh->m_pHandlingData)
+        return;
+
+    float leanFwd = *reinterpret_cast<float*>(reinterpret_cast<char*>(&g_RideData) + 0x10);
+
+    CVector com = veh->m_pHandlingData->m_vecCentreOfMass;
+    if (leanFwd > 0.0f)
+        com.y += leanFwd * LEAN_FWD_COM;
+    else if (leanFwd < 0.0f)
+        com.y += leanFwd * LEAN_BACK_COM;
+    veh->m_vecCentreOfMass = com;
+}
+
+static void ManualExhaustFromFrame(CVehicle* veh)
+{
+    if (!g_GameReady || !veh || !veh->bEngineOn || !veh->m_pRwClump)
+        return;
+
+    RwFrame* frame = FindFrame(reinterpret_cast<RpClump*>(veh->m_pRwClump), "exhaust");
+    if (!frame)
+        return;
+
+    RwMatrix* ltm = RwFrameGetLTM(frame);
+    if (!ltm)
+        return;
+
+    CVector pos(ltm->pos.x, ltm->pos.y, ltm->pos.z);
+
+    CVector vel;
+    if (veh->m_vecMoveSpeed.Magnitude() >= 0.05f)
+        vel = veh->m_vecMoveSpeed * 30.0f;
+    else
+        vel = veh->GetMatrix().GetForward() * -1.2f;
+
+    if (veh->m_fGasPedal < 0.05f && veh->m_fGasPedal > -0.05f)
+        return;
+
+    float speed = veh->m_vecMoveSpeed.Magnitude() * 0.5f;
+    float alpha = (0.25f - speed > 0.0f) ? (0.25f - speed) : 0.0f;
+    float life = (0.2f - speed > 0.0f) ? (0.2f - speed) : 0.0f;
+
+    bool underWater = false;
+    float waterZ = 0.0f;
+    CVector dummyNormal;
+    if (veh->bTouchingWater &&
+        CWaterLevel::GetWaterLevel(pos.x, pos.y, pos.z, &waterZ, true, &dummyNormal) &&
+        waterZ >= pos.z)
     {
-        float target = float(-pad->GetSteeringUpDown()) / 128.0f;
-        float* leanFwd = reinterpret_cast<float*>(reinterpret_cast<char*>(&g_RideData) + 0x10);
-        *leanFwd += (target - *leanFwd) * CTimer::ms_fTimeStep / 5.0f;
-        if (*leanFwd > 1.0f) *leanFwd = 1.0f;
-        if (*leanFwd < -1.0f) *leanFwd = -1.0f;
+        underWater = true;
     }
+
+    FxPrtMult_c fx(0.9f, 0.9f, 1.0f, alpha, 0.2f, 1.0f, life);
+    FxSystem_c* sys = g_fx.m_pPrtSmokeII3expand;
+
+    if (underWater)
+    {
+        fx.m_color.alpha = alpha * 0.5f;
+        fx.m_fSize = 0.6f;
+        if (g_fx.m_pPrtBubble)
+            sys = g_fx.m_pPrtBubble;
+    }
+
+    if (sys)
+        sys->AddParticle(&pos, &vel, 0.0f, &fx, -1.0f, veh->m_fContactSurfaceBrightness, 0.0f, 0);
 }
 
 static void ApplyBaseAndRider(CVehicle* veh, CPed* driver)
@@ -123,6 +199,7 @@ static void ApplyBaseAndRider(CVehicle* veh, CPed* driver)
     ProcessRiderAnims(driver, veh, &g_RideData, g_BikeHandling, 0);
 
     UpdateHandlebars(veh);
+    ApplyPhysicalLean(veh);
 }
 
 static void __fastcall HookedBoatRender(CBoat* self, void* /*edx*/)
@@ -158,12 +235,11 @@ public:
                 tHandlingData& qh = gHandlingDataMgr.m_aVehicleHandling[quad->m_nHandlingId];
                 dh.m_nAnimGroup = qh.m_nAnimGroup;
                 dh.m_bSitInBoat = true;
+                dh.m_bNoExhaust = false;
 
                 g_RideData = {};
                 g_RideData.m_nAnimGroup = 10;
-
-                // Fixed: search bike-handling table by its own ID field.
-                g_BikeHandling = FindQuadBikeHandling(quad->m_nHandlingId);
+                g_BikeHandling = FindQuadBikeHandling(static_cast<unsigned char>(quad->m_nHandlingId));
 
                 if (!g_BoatRenderHooked)
                 {
@@ -171,6 +247,8 @@ public:
                     plugin::patch::RedirectJump(0x6F0210, (void*)HookedBoatRender);
                     g_BoatRenderHooked = true;
                 }
+
+                g_GameReady = true;
             };
 
         static auto origGetRide = (CRideAnimData * (__thiscall*)(CVehicle*))0x871F3C;
@@ -185,13 +263,19 @@ public:
             {
                 for (CVehicle* veh : CPools::ms_pVehiclePool)
                 {
-                    if (!veh || veh->m_nModelIndex != 473 || !veh->m_pDriver)
+                    if (!veh || veh->m_nModelIndex != 473)
                         continue;
 
                     if (veh->m_pHandlingData)
+                    {
                         veh->m_pHandlingData->m_bSitInBoat = true;
+                        veh->m_pHandlingData->m_bNoExhaust = false;
+                    }
 
-                    ApplyBaseAndRider(veh, veh->m_pDriver);
+                    ManualExhaustFromFrame(veh);
+
+                    if (veh->m_pDriver)
+                        ApplyBaseAndRider(veh, veh->m_pDriver);
                 }
             };
     }

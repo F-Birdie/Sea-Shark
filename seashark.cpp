@@ -31,8 +31,9 @@ static CRideAnimData g_RideData;
 static tBikeHandlingData* g_BikeHandling = nullptr;
 static const float QUAD_HBSTEER_ANIM_MULT = -0.2f;
 
-static const float LEAN_FWD_COM = 0.50f;
-static const float LEAN_BACK_COM = 0.15f;
+// Separate pitch strength — start low, raise slowly
+static const float LEAN_PITCH_FWD = 0.003f; // forward
+static const float LEAN_PITCH_BACK = 0.001f; // back
 
 static unsigned char g_BoatRenderOriginal[5];
 static bool g_BoatRenderHooked = false;
@@ -112,17 +113,20 @@ static void UpdateRideDataLikeQuad(CVehicle* veh)
 
 static void ApplyPhysicalLean(CVehicle* veh)
 {
-    if (!veh || !veh->m_pHandlingData)
+    if (!veh)
         return;
 
     float leanFwd = *reinterpret_cast<float*>(reinterpret_cast<char*>(&g_RideData) + 0x10);
+    if (leanFwd == 0.0f)
+        return;
 
-    CVector com = veh->m_pHandlingData->m_vecCentreOfMass;
-    if (leanFwd > 0.0f)
-        com.y += leanFwd * LEAN_FWD_COM;
-    else if (leanFwd < 0.0f)
-        com.y += leanFwd * LEAN_BACK_COM;
-    veh->m_vecCentreOfMass = com;
+    float strength = (leanFwd > 0.0f) ? LEAN_PITCH_FWD : LEAN_PITCH_BACK;
+    float ts = CTimer::ms_fTimeStep;
+    float pitchForce = -leanFwd * veh->m_fTurnMass * strength * ts;
+
+    CVector force = veh->GetMatrix().GetUp() * pitchForce;
+    CVector point = veh->GetMatrix().GetForward();
+    veh->ApplyTurnForce(force, point);
 }
 
 static void ManualExhaustFromFrame(CVehicle* veh)

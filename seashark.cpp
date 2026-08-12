@@ -36,7 +36,7 @@ static CRideAnimData g_RideData;
 static tBikeHandlingData* g_BikeHandling = nullptr;
 static const float QUAD_HBSTEER_ANIM_MULT = -0.2f;
 static const float LEAN_PITCH_FWD = 0.003f;
-static const float LEAN_PITCH_BACK = 0.001f;
+static const float LEAN_PITCH_BACK = 0.002f;
 
 static const float GETOFF_LHS_SIDE = 1.0f;
 static const float GETOFF_LHS_Y = 0.0f;
@@ -51,10 +51,7 @@ static const float GETOFF_B_SPAWN_FWD = -2.0f;
 static const float GETOFF_B_SPAWN_Z = 0.0f;
 
 static const float GETOFF_MOVING_SPEED = 0.2f;
-
-// B: stop following dinghy after this many seconds
 static const float GETOFF_B_HOLD_SEC = 0.5f;
-// B: total time the jump anim is forced (can be longer than hold)
 static const float GETOFF_B_ANIM_SEC = 0.8f;
 
 static unsigned char g_BoatRenderOriginal[5];
@@ -67,14 +64,19 @@ static unsigned char g_SetPedPosOriginal[5];
 static bool g_SetPedPosHooked = false;
 static bool g_GameReady = false;
 
-static bool g_GetOffPlaying = false;   // on vehicle (hold + seat lock)
+static bool g_GetOffPlaying = false;
 static bool g_GetOffStarted = false;
 static bool g_GetOffUseB = false;
-static bool g_GetOffAnimAfter = false; // off vehicle, keep B anim
+static bool g_GetOffAnimAfter = false;
 static CPed* g_ExitPed = nullptr;
 static CVehicle* g_ExitVeh = nullptr;
 static unsigned int g_GetOffHoldEndMs = 0;
 static unsigned int g_GetOffAnimEndMs = 0;
+
+// Frame cache (one active dinghy is enough)
+static CVehicle* g_FrameCacheVeh = nullptr;
+static RwFrame* g_FrameCacheExhaust = nullptr;
+static RwFrame* g_FrameCacheHandlebars = nullptr;
 
 static void ResetExitState()
 {
@@ -86,6 +88,18 @@ static void ResetExitState()
     g_ExitVeh = nullptr;
     g_GetOffHoldEndMs = 0;
     g_GetOffAnimEndMs = 0;
+}
+
+static void ClearFrameCache()
+{
+    g_FrameCacheVeh = nullptr;
+    g_FrameCacheExhaust = nullptr;
+    g_FrameCacheHandlebars = nullptr;
+}
+
+static CAnimBlendAssociation* GetClumpAssoc(RpClump* clump, unsigned int animId)
+{
+    return reinterpret_cast<CAnimBlendAssociation * (__cdecl*)(RpClump*, unsigned int)>(0x4D68B0)(clump, animId);
 }
 
 static CVector GetOffHoldPos(CVehicle* veh)
@@ -128,8 +142,7 @@ static tBikeHandlingData* FindQuadBikeHandling(unsigned int generalHandlingId)
 {
     for (int i = 0; i < 13; ++i)
     {
-        if (gHandlingDataMgr.m_aBikeHandling[i].m_nVehicleId == static_cast<unsigned char>(generalHandlingId) ||
-            gHandlingDataMgr.m_aBikeHandling[i].m_nVehicleId == generalHandlingId)
+        if (gHandlingDataMgr.m_aBikeHandling[i].m_nVehicleId == generalHandlingId)
             return &gHandlingDataMgr.m_aBikeHandling[i];
     }
     return nullptr;
@@ -142,16 +155,36 @@ static RwFrame* FindFrame(RpClump* clump, const char* name)
     return CClumpModelInfo::GetFrameFromName(clump, const_cast<char*>(name));
 }
 
+static void EnsureFrameCache(CVehicle* veh)
+{
+    if (!veh || !veh->m_pRwClump)
+    {
+        ClearFrameCache();
+        return;
+    }
+    if (g_FrameCacheVeh == veh)
+        return;
+
+    g_FrameCacheVeh = veh;
+    RpClump* clump = reinterpret_cast<RpClump*>(veh->m_pRwClump);
+    g_FrameCacheExhaust = FindFrame(clump, "exhaust");
+    g_FrameCacheHandlebars = FindFrame(clump, "handlebars");
+}
+
 static void UpdateHandlebars(CVehicle* veh)
 {
     if (!veh || !veh->m_pRwClump)
         return;
-    RwFrame* hb = FindFrame(reinterpret_cast<RpClump*>(veh->m_pRwClump), "handlebars");
+
+    EnsureFrameCache(veh);
+    RwFrame* hb = g_FrameCacheHandlebars;
     if (!hb)
         return;
+
     float animLeanLeft = *reinterpret_cast<float*>(reinterpret_cast<char*>(&g_RideData) + 0x14);
     if (animLeanLeft == 0.0f && veh->m_fSteerAngle != 0.0f)
         animLeanLeft = veh->m_fSteerAngle;
+
     CMatrix mat;
     mat.Attach(RwFrameGetMatrix(hb), false);
     mat.SetRotateZOnly(QUAD_HBSTEER_ANIM_MULT * animLeanLeft);
@@ -162,24 +195,30 @@ static void UpdateRideDataLikeQuad(CVehicle* veh)
 {
     if (!veh || !g_BikeHandling)
         return;
+
     g_RideData.m_nAnimGroup = 10;
     g_RideData.m_fSteerAngle = veh->m_fSteerAngle;
+
     float steeringLockRad = 0.6f;
     if (veh->m_pHandlingData)
         steeringLockRad = veh->m_pHandlingData->m_fSteeringLock * (3.14159265f / 180.0f);
     if (steeringLockRad < 0.1f)
         steeringLockRad = 0.1f;
+
     float fullAnimLean = g_BikeHandling->m_fFullAnimLean;
     float desLean = g_BikeHandling->m_fDesLean;
     float fValue = powf(desLean, CTimer::ms_fTimeStep);
     float& leanAngle = g_RideData.m_fAnimLean;
+
     leanAngle = fValue * leanAngle
         - fullAnimLean * veh->m_fSteerAngle / steeringLockRad * (1.0f - fValue);
+
     float* leanFwd = reinterpret_cast<float*>(reinterpret_cast<char*>(&g_RideData) + 0x10);
     CPad* pad = CPad::GetPad(0);
     float target = 0.0f;
     if (pad)
         target = float(-pad->GetSteeringUpDown()) / 128.0f;
+
     *leanFwd += (target - *leanFwd) * CTimer::ms_fTimeStep / 5.0f;
     if (*leanFwd > 1.0f) *leanFwd = 1.0f;
     if (*leanFwd < -1.0f) *leanFwd = -1.0f;
@@ -191,12 +230,15 @@ static void ApplyPhysicalLean(CVehicle* veh)
 {
     if (!veh)
         return;
+
     float leanFwd = *reinterpret_cast<float*>(reinterpret_cast<char*>(&g_RideData) + 0x10);
     if (leanFwd == 0.0f)
         return;
+
     float strength = (leanFwd > 0.0f) ? LEAN_PITCH_FWD : LEAN_PITCH_BACK;
     float ts = CTimer::ms_fTimeStep;
     float pitchForce = -leanFwd * veh->m_fTurnMass * strength * ts;
+
     CVector force = veh->GetMatrix().GetUp() * pitchForce;
     CVector point = veh->GetMatrix().GetForward();
     veh->ApplyTurnForce(force, point);
@@ -208,28 +250,37 @@ static void ManualExhaustFromFrame(CVehicle* veh)
         return;
     if (veh->m_fGasPedal < 0.05f && veh->m_fGasPedal > -0.05f)
         return;
-    RwFrame* frame = FindFrame(reinterpret_cast<RpClump*>(veh->m_pRwClump), "exhaust");
+
+    EnsureFrameCache(veh);
+    RwFrame* frame = g_FrameCacheExhaust;
     if (!frame)
         return;
+
     RwMatrix* ltm = RwFrameGetLTM(frame);
     if (!ltm)
         return;
+
     CVector pos(ltm->pos.x, ltm->pos.y, ltm->pos.z);
     CVector vel;
     if (veh->m_vecMoveSpeed.Magnitude() >= 0.05f)
         vel = veh->m_vecMoveSpeed * 30.0f;
     else
         vel = veh->GetMatrix().GetForward() * -1.2f;
+
     float speed = veh->m_vecMoveSpeed.Magnitude() * 0.5f;
     float alpha = (0.25f - speed > 0.0f) ? (0.25f - speed) : 0.0f;
     float life = (0.2f - speed > 0.0f) ? (0.2f - speed) : 0.0f;
+
     bool underWater = false;
     float waterZ = 0.0f;
     CVector dummyNormal;
     if (veh->bTouchingWater &&
         CWaterLevel::GetWaterLevel(pos.x, pos.y, pos.z, &waterZ, true, &dummyNormal) &&
         waterZ >= pos.z)
+    {
         underWater = true;
+    }
+
     FxPrtMult_c fx(0.9f, 0.9f, 1.0f, alpha, 0.2f, 1.0f, life);
     FxSystem_c* sys = g_fx.m_pPrtSmokeII3expand;
     if (underWater)
@@ -251,16 +302,29 @@ static void ApplyBaseAndRider(CVehicle* veh, CPed* driver)
         return;
 
     RpClump* clump = reinterpret_cast<RpClump*>(driver->m_pRwClump);
-    CAnimBlendAssociation* base = CAnimManager::BlendAnimation(clump, 10, QUAD_RIDE_0, 1000.0f);
-    if (base)
+
+    // Only re-apply base sit if missing / faded out
+    CAnimBlendAssociation* base = GetClumpAssoc(clump, QUAD_RIDE_0);
+    if (!base || base->m_fBlendAmount < 0.95f)
     {
-        base->SetBlend(1.0f, 0.0f);
+        base = CAnimManager::BlendAnimation(clump, 10, QUAD_RIDE_0, 1000.0f);
+        if (base)
+        {
+            base->SetBlend(1.0f, 0.0f);
+            base->m_fCurrentTime = 0.0f;
+        }
+    }
+    else
+    {
         base->m_fCurrentTime = 0.0f;
     }
+
     UpdateRideDataLikeQuad(veh);
+
     using Fn = void(__cdecl*)(CPed*, CVehicle*, CRideAnimData*, tBikeHandlingData*, short);
     static Fn ProcessRiderAnims = (Fn)0x6B7280;
     ProcessRiderAnims(driver, veh, &g_RideData, g_BikeHandling, 0);
+
     UpdateHandlebars(veh);
     ApplyPhysicalLean(veh);
 }
@@ -269,9 +333,15 @@ static void MaintainGetOffBAnim(CPed* ped)
 {
     if (!ped || !ped->m_pRwClump)
         return;
+
     RpClump* clump = reinterpret_cast<RpClump*>(ped->m_pRwClump);
-    CAnimBlendAssociation* assoc =
-        CAnimManager::BlendAnimation(clump, 100, QUAD_GETOFF_B_0, 1000.0f);
+    CAnimBlendAssociation* assoc = GetClumpAssoc(clump, QUAD_GETOFF_B_0);
+
+    // Already strong — don't re-blend every frame
+    if (assoc && assoc->m_fBlendAmount >= 0.95f)
+        return;
+
+    assoc = CAnimManager::BlendAnimation(clump, 100, QUAD_GETOFF_B_0, 1000.0f);
     if (assoc)
     {
         assoc->m_nFlags &= ~static_cast<unsigned short>(2);
@@ -305,10 +375,8 @@ static void PlayGetOffOnce(CPed* ped)
     }
 
     unsigned int now = CTimer::m_snTimeInMilliseconds;
-
     if (g_GetOffUseB)
     {
-        // Separate: leave vehicle vs keep anim
         g_GetOffHoldEndMs = now + static_cast<unsigned int>(GETOFF_B_HOLD_SEC * 1000.0f);
         g_GetOffAnimEndMs = now + static_cast<unsigned int>(GETOFF_B_ANIM_SEC * 1000.0f);
         if (g_GetOffAnimEndMs < g_GetOffHoldEndMs)
@@ -319,7 +387,6 @@ static void PlayGetOffOnce(CPed* ped)
         g_GetOffHoldEndMs = now + static_cast<unsigned int>(lhsDurationSec * 1000.0f);
         g_GetOffAnimEndMs = g_GetOffHoldEndMs;
     }
-
     g_GetOffStarted = true;
 }
 
@@ -341,7 +408,6 @@ static void FinishWithSetPedOut()
     const bool continueB = g_GetOffUseB &&
         (CTimer::m_snTimeInMilliseconds < g_GetOffAnimEndMs);
 
-    // Stop vehicle follow / seat lock
     g_GetOffPlaying = false;
     g_ExitVeh = nullptr;
 
@@ -479,6 +545,7 @@ public:
                 }
 
                 ResetExitState();
+                ClearFrameCache();
                 g_GameReady = true;
             };
 
@@ -489,7 +556,6 @@ public:
 
                 unsigned int now = CTimer::m_snTimeInMilliseconds;
 
-                // 1) Leave dinghy (stop follow) — hold timer only
                 if (g_GetOffPlaying &&
                     g_GetOffHoldEndMs != 0 &&
                     now >= g_GetOffHoldEndMs)
@@ -497,23 +563,25 @@ public:
                     FinishWithSetPedOut();
                 }
 
-                // 2) After eject: keep B anim until anim timer
                 if (g_GetOffAnimAfter && g_ExitPed)
                 {
                     if (now >= g_GetOffAnimEndMs)
-                    {
                         ResetExitState();
-                    }
                     else
-                    {
                         MaintainGetOffBAnim(g_ExitPed);
-                    }
                 }
 
                 for (CVehicle* veh : CPools::ms_pVehiclePool)
                 {
                     if (!veh || veh->m_nModelIndex != 473)
                         continue;
+
+                    // Drop frame cache if this instance was removed / replaced
+                    if (g_FrameCacheVeh && g_FrameCacheVeh != veh && !veh->m_pDriver)
+                        /* keep cache if another 473 is active */;
+                    if (g_FrameCacheVeh == veh && !veh->m_pRwClump)
+                        ClearFrameCache();
+
                     ManualExhaustFromFrame(veh);
                     if (veh->m_pDriver)
                         ApplyBaseAndRider(veh, veh->m_pDriver);

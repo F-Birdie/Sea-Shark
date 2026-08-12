@@ -134,6 +134,12 @@ static void ManualExhaustFromFrame(CVehicle* veh)
     if (!g_GameReady || !veh || !veh->bEngineOn || !veh->m_pRwClump)
         return;
 
+    // Moved up from the bottom of the function: this is the common case
+    // (no gas pressed most frames), so bail before doing the frame lookup
+    // and velocity math instead of after.
+    if (veh->m_fGasPedal < 0.05f && veh->m_fGasPedal > -0.05f)
+        return;
+
     RwFrame* frame = FindFrame(reinterpret_cast<RpClump*>(veh->m_pRwClump), "exhaust");
     if (!frame)
         return;
@@ -149,9 +155,6 @@ static void ManualExhaustFromFrame(CVehicle* veh)
         vel = veh->m_vecMoveSpeed * 30.0f;
     else
         vel = veh->GetMatrix().GetForward() * -1.2f;
-
-    if (veh->m_fGasPedal < 0.05f && veh->m_fGasPedal > -0.05f)
-        return;
 
     float speed = veh->m_vecMoveSpeed.Magnitude() * 0.5f;
     float alpha = (0.25f - speed > 0.0f) ? (0.25f - speed) : 0.0f;

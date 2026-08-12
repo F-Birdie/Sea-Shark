@@ -21,13 +21,15 @@
 #include "Fx_c.h"
 #include "FxPrtMult_c.h"
 #include "CTaskSimpleCarSetPedOut.h"
+#include "CCamera.h"
 #include <cstring>
 
 using namespace plugin;
 
 enum {
     QUAD_RIDE_0 = 194,
-    QUAD_GETOFF_LHS_0 = 373
+    QUAD_GETOFF_LHS_0 = 373,
+    QUAD_GETOFF_B_0 = 377
 };
 
 static CRideAnimData g_RideData;
@@ -36,9 +38,24 @@ static const float QUAD_HBSTEER_ANIM_MULT = -0.2f;
 static const float LEAN_PITCH_FWD = 0.003f;
 static const float LEAN_PITCH_BACK = 0.001f;
 
-static const float GETOFF_SIDE_OFFSET = 1.0f;
-static const float GETOFF_Y_OFFSET = 0.0f;
-static const float GETOFF_Z_OFFSET = 0.8f;
+static const float GETOFF_LHS_SIDE = 1.0f;
+static const float GETOFF_LHS_Y = 0.0f;
+static const float GETOFF_LHS_Z = 0.8f;
+
+static const float GETOFF_B_HOLD_SIDE = 0.0f;
+static const float GETOFF_B_HOLD_FWD = -0.4f;
+static const float GETOFF_B_HOLD_Z = 0.8f;
+
+static const float GETOFF_B_SPAWN_SIDE = 0.0f;
+static const float GETOFF_B_SPAWN_FWD = -2.0f;
+static const float GETOFF_B_SPAWN_Z = 0.0f;
+
+static const float GETOFF_MOVING_SPEED = 0.2f;
+
+// B: stop following dinghy after this many seconds
+static const float GETOFF_B_HOLD_SEC = 0.5f;
+// B: total time the jump anim is forced (can be longer than hold)
+static const float GETOFF_B_ANIM_SEC = 0.8f;
 
 static unsigned char g_BoatRenderOriginal[5];
 static bool g_BoatRenderHooked = false;
@@ -50,28 +67,60 @@ static unsigned char g_SetPedPosOriginal[5];
 static bool g_SetPedPosHooked = false;
 static bool g_GameReady = false;
 
-static bool g_GetOffPlaying = false;
+static bool g_GetOffPlaying = false;   // on vehicle (hold + seat lock)
 static bool g_GetOffStarted = false;
+static bool g_GetOffUseB = false;
+static bool g_GetOffAnimAfter = false; // off vehicle, keep B anim
 static CPed* g_ExitPed = nullptr;
 static CVehicle* g_ExitVeh = nullptr;
-static unsigned int g_GetOffEndMs = 0;
+static unsigned int g_GetOffHoldEndMs = 0;
+static unsigned int g_GetOffAnimEndMs = 0;
 
 static void ResetExitState()
 {
     g_GetOffPlaying = false;
     g_GetOffStarted = false;
+    g_GetOffUseB = false;
+    g_GetOffAnimAfter = false;
     g_ExitPed = nullptr;
     g_ExitVeh = nullptr;
-    g_GetOffEndMs = 0;
+    g_GetOffHoldEndMs = 0;
+    g_GetOffAnimEndMs = 0;
 }
 
-// Absolute get-off pose from vehicle only — never ped->GetPosition() (avoids stacking)
-static CVector GetOffWorldPos(CVehicle* veh)
+static CVector GetOffHoldPos(CVehicle* veh)
 {
     CVector pos = veh->GetPosition();
-    pos += veh->GetMatrix().GetRight() * (-GETOFF_SIDE_OFFSET);
-    pos.y += GETOFF_Y_OFFSET;
-    pos.z += GETOFF_Z_OFFSET;
+    if (g_GetOffUseB)
+    {
+        pos += veh->GetMatrix().GetRight() * (-GETOFF_B_HOLD_SIDE);
+        pos += veh->GetMatrix().GetForward() * GETOFF_B_HOLD_FWD;
+        pos.z += GETOFF_B_HOLD_Z;
+    }
+    else
+    {
+        pos += veh->GetMatrix().GetRight() * (-GETOFF_LHS_SIDE);
+        pos.y += GETOFF_LHS_Y;
+        pos.z += GETOFF_LHS_Z;
+    }
+    return pos;
+}
+
+static CVector GetOffSpawnPos(CVehicle* veh)
+{
+    CVector pos = veh->GetPosition();
+    if (g_GetOffUseB)
+    {
+        pos += veh->GetMatrix().GetRight() * (-GETOFF_B_SPAWN_SIDE);
+        pos += veh->GetMatrix().GetForward() * GETOFF_B_SPAWN_FWD;
+        pos.z += GETOFF_B_SPAWN_Z;
+    }
+    else
+    {
+        pos += veh->GetMatrix().GetRight() * (-GETOFF_LHS_SIDE);
+        pos.y += GETOFF_LHS_Y;
+        pos.z += GETOFF_LHS_Z;
+    }
     return pos;
 }
 
@@ -198,7 +247,7 @@ static void ApplyBaseAndRider(CVehicle* veh, CPed* driver)
 {
     if (!veh || !driver || !driver->m_pRwClump || !g_BikeHandling)
         return;
-    if (g_GetOffPlaying)
+    if (g_GetOffPlaying || g_GetOffAnimAfter)
         return;
 
     RpClump* clump = reinterpret_cast<RpClump*>(driver->m_pRwClump);
@@ -216,16 +265,35 @@ static void ApplyBaseAndRider(CVehicle* veh, CPed* driver)
     ApplyPhysicalLean(veh);
 }
 
+static void MaintainGetOffBAnim(CPed* ped)
+{
+    if (!ped || !ped->m_pRwClump)
+        return;
+    RpClump* clump = reinterpret_cast<RpClump*>(ped->m_pRwClump);
+    CAnimBlendAssociation* assoc =
+        CAnimManager::BlendAnimation(clump, 100, QUAD_GETOFF_B_0, 1000.0f);
+    if (assoc)
+    {
+        assoc->m_nFlags &= ~static_cast<unsigned short>(2);
+        assoc->SetBlend(1.0f, 0.0f);
+    }
+}
+
 static void PlayGetOffOnce(CPed* ped)
 {
     if (!ped || !ped->m_pRwClump || g_GetOffStarted)
         return;
 
+    g_GetOffUseB = (g_ExitVeh &&
+        g_ExitVeh->m_vecMoveSpeed.Magnitude() > GETOFF_MOVING_SPEED);
+
+    unsigned int animId = g_GetOffUseB ? QUAD_GETOFF_B_0 : QUAD_GETOFF_LHS_0;
+
     RpClump* clump = reinterpret_cast<RpClump*>(ped->m_pRwClump);
     CAnimBlendAssociation* assoc =
-        CAnimManager::BlendAnimation(clump, 100, QUAD_GETOFF_LHS_0, 1000.0f);
+        CAnimManager::BlendAnimation(clump, 100, animId, 1000.0f);
 
-    float durationSec = 0.70f;
+    float lhsDurationSec = 0.70f;
     if (assoc)
     {
         assoc->m_nFlags &= ~static_cast<unsigned short>(2);
@@ -233,10 +301,25 @@ static void PlayGetOffOnce(CPed* ped)
         assoc->SetCurrentTime(0.0f);
         assoc->SetBlend(1.0f, 0.0f);
         if (assoc->m_pHierarchy && assoc->m_pHierarchy->m_fTotalTime > 0.05f)
-            durationSec = assoc->m_pHierarchy->m_fTotalTime;
+            lhsDurationSec = assoc->m_pHierarchy->m_fTotalTime;
     }
-    g_GetOffEndMs = CTimer::m_snTimeInMilliseconds
-        + static_cast<unsigned int>(durationSec * 1000.0f);
+
+    unsigned int now = CTimer::m_snTimeInMilliseconds;
+
+    if (g_GetOffUseB)
+    {
+        // Separate: leave vehicle vs keep anim
+        g_GetOffHoldEndMs = now + static_cast<unsigned int>(GETOFF_B_HOLD_SEC * 1000.0f);
+        g_GetOffAnimEndMs = now + static_cast<unsigned int>(GETOFF_B_ANIM_SEC * 1000.0f);
+        if (g_GetOffAnimEndMs < g_GetOffHoldEndMs)
+            g_GetOffAnimEndMs = g_GetOffHoldEndMs;
+    }
+    else
+    {
+        g_GetOffHoldEndMs = now + static_cast<unsigned int>(lhsDurationSec * 1000.0f);
+        g_GetOffAnimEndMs = g_GetOffHoldEndMs;
+    }
+
     g_GetOffStarted = true;
 }
 
@@ -250,12 +333,17 @@ static void FinishWithSetPedOut()
         return;
     }
 
-    CVector spawnPos = GetOffWorldPos(veh);
+    CVector spawnPos = GetOffSpawnPos(veh);
     float heading = atan2f(
         -veh->GetMatrix().GetForward().x,
         veh->GetMatrix().GetForward().y);
 
-    ResetExitState();
+    const bool continueB = g_GetOffUseB &&
+        (CTimer::m_snTimeInMilliseconds < g_GetOffAnimEndMs);
+
+    // Stop vehicle follow / seat lock
+    g_GetOffPlaying = false;
+    g_ExitVeh = nullptr;
 
     CTaskSimpleCarSetPedOut* setOut = new CTaskSimpleCarSetPedOut(veh, 0, false);
     reinterpret_cast<bool(__thiscall*)(CTaskSimpleCarSetPedOut*, CPed*)>(0x647D10)(setOut, ped);
@@ -265,6 +353,20 @@ static void FinishWithSetPedOut()
     ped->SetHeading(heading);
     ped->GetMatrix().UpdateRW();
     ped->UpdateRwFrame();
+
+    if (ped == FindPlayerPed())
+        TheCamera.RestoreWithJumpCut();
+
+    if (continueB)
+    {
+        g_GetOffAnimAfter = true;
+        g_ExitPed = ped;
+        MaintainGetOffBAnim(ped);
+    }
+    else
+    {
+        ResetExitState();
+    }
 }
 
 static void __fastcall HookedSetPedPositionInCar(CPed* self, void* /*edx*/)
@@ -276,8 +378,7 @@ static void __fastcall HookedSetPedPositionInCar(CPed* self, void* /*edx*/)
     if (!g_GetOffPlaying || self != g_ExitPed || !g_ExitVeh)
         return;
 
-    // Always vehicle-relative absolute pose — cannot stack
-    CVector pos = GetOffWorldPos(g_ExitVeh);
+    CVector pos = GetOffHoldPos(g_ExitVeh);
     self->SetPosn(pos);
     self->GetMatrix().UpdateRW();
     self->UpdateRwFrame();
@@ -289,7 +390,7 @@ static CTask* __fastcall HookedLeaveBoatCreateFirst(void* self, void* /*edx*/, C
 
     if (veh && veh->m_nModelIndex == 473)
     {
-        if (!g_GetOffPlaying && ped)
+        if (!g_GetOffPlaying && !g_GetOffAnimAfter && ped)
         {
             ResetExitState();
             g_GetOffPlaying = true;
@@ -386,11 +487,27 @@ public:
                 if (!g_GameReady)
                     return;
 
+                unsigned int now = CTimer::m_snTimeInMilliseconds;
+
+                // 1) Leave dinghy (stop follow) — hold timer only
                 if (g_GetOffPlaying &&
-                    g_GetOffEndMs != 0 &&
-                    CTimer::m_snTimeInMilliseconds >= g_GetOffEndMs)
+                    g_GetOffHoldEndMs != 0 &&
+                    now >= g_GetOffHoldEndMs)
                 {
                     FinishWithSetPedOut();
+                }
+
+                // 2) After eject: keep B anim until anim timer
+                if (g_GetOffAnimAfter && g_ExitPed)
+                {
+                    if (now >= g_GetOffAnimEndMs)
+                    {
+                        ResetExitState();
+                    }
+                    else
+                    {
+                        MaintainGetOffBAnim(g_ExitPed);
+                    }
                 }
 
                 for (CVehicle* veh : CPools::ms_pVehiclePool)

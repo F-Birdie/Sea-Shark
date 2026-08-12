@@ -30,21 +30,26 @@ enum {
 static CRideAnimData g_RideData;
 static tBikeHandlingData* g_BikeHandling = nullptr;
 static const float QUAD_HBSTEER_ANIM_MULT = -0.2f;
-
-// Separate pitch strength — start low, raise slowly
-static const float LEAN_PITCH_FWD = 0.003f; // forward
-static const float LEAN_PITCH_BACK = 0.001f; // back
+static const float LEAN_PITCH_FWD = 0.003f;
+static const float LEAN_PITCH_BACK = 0.001f;
 
 static unsigned char g_BoatRenderOriginal[5];
 static bool g_BoatRenderHooked = false;
+
+static unsigned char g_GetRideOriginal[5];
+static bool g_GetRideHooked = false;
+
 static bool g_GameReady = false;
 
-static tBikeHandlingData* FindQuadBikeHandling(unsigned char generalHandlingId)
+static tBikeHandlingData* FindQuadBikeHandling(unsigned int generalHandlingId)
 {
     for (int i = 0; i < 13; ++i)
     {
-        if (gHandlingDataMgr.m_aBikeHandling[i].m_nVehicleId == generalHandlingId)
+        if (gHandlingDataMgr.m_aBikeHandling[i].m_nVehicleId == static_cast<unsigned char>(generalHandlingId) ||
+            gHandlingDataMgr.m_aBikeHandling[i].m_nVehicleId == generalHandlingId)
+        {
             return &gHandlingDataMgr.m_aBikeHandling[i];
+        }
     }
     return nullptr;
 }
@@ -65,6 +70,7 @@ static void UpdateHandlebars(CVehicle* veh)
     if (!hb)
         return;
 
+    // 0x14 = m_fHandlebarsAngle in plugin-sdk CRideAnimData
     float animLeanLeft = *reinterpret_cast<float*>(reinterpret_cast<char*>(&g_RideData) + 0x14);
     if (animLeanLeft == 0.0f && veh->m_fSteerAngle != 0.0f)
         animLeanLeft = veh->m_fSteerAngle;
@@ -97,6 +103,7 @@ static void UpdateRideDataLikeQuad(CVehicle* veh)
     leanAngle = fValue * leanAngle
         - fullAnimLean * veh->m_fSteerAngle / steeringLockRad * (1.0f - fValue);
 
+    // 0x10 = lean-forward field written by rider anims / our pitch input
     float* leanFwd = reinterpret_cast<float*>(reinterpret_cast<char*>(&g_RideData) + 0x10);
     CPad* pad = CPad::GetPad(0);
 
@@ -134,9 +141,6 @@ static void ManualExhaustFromFrame(CVehicle* veh)
     if (!g_GameReady || !veh || !veh->bEngineOn || !veh->m_pRwClump)
         return;
 
-    // Moved up from the bottom of the function: this is the common case
-    // (no gas pressed most frames), so bail before doing the frame lookup
-    // and velocity math instead of after.
     if (veh->m_fGasPedal < 0.05f && veh->m_fGasPedal > -0.05f)
         return;
 
@@ -223,6 +227,18 @@ static void __fastcall HookedBoatRender(CBoat* self, void* /*edx*/)
     plugin::patch::RedirectJump(0x6F0210, (void*)HookedBoatRender);
 }
 
+// Real trampoline — does not call the JMP stub (avoids infinite recursion)
+static CRideAnimData* __fastcall HookedGetRide(CVehicle* self, void* /*edx*/)
+{
+    if (self && self->m_nModelIndex == 473)
+        return &g_RideData;
+
+    memcpy(reinterpret_cast<void*>(0x871F3C), g_GetRideOriginal, 5);
+    CRideAnimData* result = reinterpret_cast<CRideAnimData * (__thiscall*)(CVehicle*)>(0x871F3C)(self);
+    plugin::patch::RedirectJump(0x871F3C, (void*)HookedGetRide);
+    return result;
+}
+
 class JetSkiWayA
 {
 public:
@@ -246,7 +262,7 @@ public:
 
                 g_RideData = {};
                 g_RideData.m_nAnimGroup = 10;
-                g_BikeHandling = FindQuadBikeHandling(static_cast<unsigned char>(quad->m_nHandlingId));
+                g_BikeHandling = FindQuadBikeHandling(quad->m_nHandlingId);
 
                 if (!g_BoatRenderHooked)
                 {
@@ -255,29 +271,25 @@ public:
                     g_BoatRenderHooked = true;
                 }
 
+                if (!g_GetRideHooked)
+                {
+                    memcpy(g_GetRideOriginal, reinterpret_cast<void*>(0x871F3C), 5);
+                    plugin::patch::RedirectJump(0x871F3C, (void*)HookedGetRide);
+                    g_GetRideHooked = true;
+                }
+
                 g_GameReady = true;
             };
 
-        static auto origGetRide = (CRideAnimData * (__thiscall*)(CVehicle*))0x871F3C;
-        plugin::patch::RedirectJump(0x871F3C, (void*)+[](CVehicle* v) -> CRideAnimData*
-            {
-                if (v && v->m_nModelIndex == 473)
-                    return &g_RideData;
-                return origGetRide(v);
-            });
-
         Events::gameProcessEvent += []
             {
+                if (!g_GameReady)
+                    return;
+
                 for (CVehicle* veh : CPools::ms_pVehiclePool)
                 {
                     if (!veh || veh->m_nModelIndex != 473)
                         continue;
-
-                    if (veh->m_pHandlingData)
-                    {
-                        veh->m_pHandlingData->m_bSitInBoat = true;
-                        veh->m_pHandlingData->m_bNoExhaust = false;
-                    }
 
                     ManualExhaustFromFrame(veh);
 
